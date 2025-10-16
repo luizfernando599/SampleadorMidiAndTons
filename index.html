@@ -1,0 +1,221 @@
+<!doctype html>
+
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PitchSampler — Sampler MIDI (single-file)</title>
+  <style>
+    :root{--bg:#0b1020;--panel:#0f1724;--accent:#7dd3fc;--muted:#94a3b8}
+    html,body{height:100%;margin:0;font-family:Inter, system-ui, Arial;background:linear-gradient(180deg,#020617 0%,#071029 100%);color:#e6eef6}
+    .app{max-width:1100px;margin:28px auto;padding:20px;background:rgba(255,255,255,0.03);border-radius:14px;box-shadow:0 6px 30px rgba(2,6,23,0.6)}
+    header{display:flex;align-items:center;justify-content:space-between;gap:12px}
+    h1{font-size:20px;margin:0}
+    .top-controls{display:flex;gap:10px;align-items:center}
+    button{background:var(--accent);border:none;padding:8px 12px;border-radius:10px;cursor:pointer;color:#042;font-weight:600}
+    .channel-rack{margin-top:18px;display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+    .channel{background:var(--panel);padding:12px;border-radius:10px;box-shadow:inset 0 -2px 0 rgba(0,0,0,0.25)}
+    .channel h3{margin:0 0 8px 0;font-size:14px}
+    .row{display:flex;gap:8px;align-items:center}
+    select,input[type=file]{background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:inherit;padding:6px;border-radius:8px}
+    .small{font-size:13px;color:var(--muted)}
+    .note-buttons{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+    .note-buttons button{background:transparent;border:1px solid rgba(255,255,255,0.04);padding:6px 8px;border-radius:6px;color:var(--muted);cursor:pointer}
+    footer{margin-top:14px;font-size:13px;color:var(--muted)}
+    .controls-right{display:flex;gap:8px;align-items:center}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>PitchSampler — Sampler MIDI (single-file)</h1>
+        <div class="small">Arraste/seleciona um áudio por canal. O padrão de referência é C4. Use um controlador MIDI ou os botões para tocar.</div>
+      </div>
+      <div class="top-controls">
+        <button id="addChannelBtn">+ Novo canal</button>
+        <div class="controls-right">
+          <button id="requestMidi">Conectar MIDI</button>
+          <button id="stopAll">Parar todos</button>
+        </div>
+      </div>
+    </header><section class="channel-rack" id="rack"></section>
+
+<footer>
+  Salve este arquivo como <code>index.html</code> e publique no GitHub Pages (branch <code>main</code> ou <code>gh-pages</code>). Funciona em navegadores modernos com Web Audio e Web MIDI.
+</footer>
+
+  </div><script>
+// PitchSampler — single-file
+// Recursos implementados:
+// - múltiplos canais (add/remove)
+// - carregar arquivos (decodifica com WebAudio)
+// - seleção de nota raiz (nota + oitava) — padrão: C4
+// - controle via Web MIDI: quando receber NOTE ON, toca sample com ajuste de pitch
+// - também tem botões virtuais para testar
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+const rackEl = document.getElementById('rack');
+const addChannelBtn = document.getElementById('addChannelBtn');
+const requestMidiBtn = document.getElementById('requestMidi');
+const stopAllBtn = document.getElementById('stopAll');
+
+let channels = [];
+let midiAccess = null;
+let activeSources = new Set();
+
+const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+function noteNameToMidi(noteName, octave){
+  const idx = NOTE_NAMES.indexOf(noteName);
+  if(idx<0) return 60; // fallback C4
+  return idx + ((octave+1) * 12); // MIDI: C-1 = 0, so octave 0 => C0 = 12, so shift by +1
+}
+
+function midiToNoteName(m){
+  const name = NOTE_NAMES[m%12];
+  const octave = Math.floor(m/12)-1;
+  return name+octave;
+}
+
+function createChannel(){
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+  const channel = {
+    id, buffer: null, gain: 0.9, rootNoteName: 'C', rootOctave: 4, enabled: true, label: 'Channel'
+  };
+  channels.push(channel);
+  renderChannels();
+}
+
+function removeChannel(id){
+  channels = channels.filter(c=>c.id!==id);
+  renderChannels();
+}
+
+function renderChannels(){
+  rackEl.innerHTML = '';
+  channels.forEach((ch, idx)=>{
+    const div = document.createElement('div'); div.className='channel';
+    div.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h3>${ch.label} ${idx+1}</h3>
+        <div style="display:flex;gap:8px;align-items:center">
+          <label class="small">on<input type="checkbox" data-id="${ch.id}" ${ch.enabled? 'checked':''}></label>
+          <button data-remove="${ch.id}">Remover</button>
+        </div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input type="file" accept="audio/*" data-file="${ch.id}" />
+        <select data-root-note="${ch.id}"></select>
+        <select data-root-octave="${ch.id}"></select>
+      </div>
+      <div class="small" style="margin-top:8px" data-status="${ch.id}\">Nenhum áudio carregado</div>
+      <div class="note-buttons" data-playbar="${ch.id}"></div>
+    `;
+
+    rackEl.appendChild(div);
+
+    // populate selects
+    const noteSelect = div.querySelector(`select[data-root-note='${ch.id}']`);
+    NOTE_NAMES.forEach(n=>{ const opt = document.createElement('option'); opt.value=n; opt.textContent=n; if(n===ch.rootNoteName) opt.selected=true; noteSelect.appendChild(opt); });
+    const octSel = div.querySelector(`select[data-root-octave='${ch.id}']`);
+    for(let o=0;o<=8;o++){ const opt = document.createElement('option'); opt.value=o; opt.textContent=o; if(o===ch.rootOctave) opt.selected=true; octSel.appendChild(opt);}    
+
+    // wire file input
+    const fileInput = div.querySelector(`input[type=file][data-file='${ch.id}']`);
+    fileInput.addEventListener('change', async (e)=>{
+      const f = e.target.files[0];
+      if(!f) return;
+      const array = await f.arrayBuffer();
+      try{
+        const decoded = await audioCtx.decodeAudioData(array);
+        ch.buffer = decoded;
+        div.querySelector(`[data-status='${ch.id}']`).textContent = `Carregado: ${f.name} — ${Math.round(decoded.duration*100)/100}s`;
+      }catch(err){
+        console.error(err);
+        div.querySelector(`[data-status='${ch.id}']`).textContent = 'Erro ao decodificar o áudio';
+      }
+      renderNoteButtons(ch, div.querySelector(`[data-playbar='${ch.id}']`));
+    });
+
+    // root change
+    noteSelect.addEventListener('change', (e)=>{ ch.rootNoteName = e.target.value; });
+    octSel.addEventListener('change', (e)=>{ ch.rootOctave = parseInt(e.target.value); });
+
+    // enabled toggle
+    const chk = div.querySelector(`input[type=checkbox][data-id='${ch.id}']`);
+    chk.addEventListener('change', (e)=>{ ch.enabled = e.target.checked; });
+
+    // remove
+    div.querySelector(`button[data-remove='${ch.id}']`).addEventListener('click', ()=>{ removeChannel(ch.id); });
+  });
+}
+
+function renderNoteButtons(channel, container){
+  container.innerHTML = '';
+  // render one octave centered on root
+  const rootMidi = noteNameToMidi(channel.rootNoteName, channel.rootOctave);
+  for(let i=0;i<12;i++){
+    const midi = rootMidi + i;
+    const btn = document.createElement('button'); btn.textContent = midiToNoteName(midi);
+    btn.addEventListener('click', ()=>{ triggerNoteOn(channel, midi); });
+    container.appendChild(btn);
+  }
+}
+
+function triggerNoteOn(channel, midiNote){
+  if(!channel.buffer || !channel.enabled) return;
+  const rootMidi = noteNameToMidi(channel.rootNoteName, channel.rootOctave);
+  const semitone = midiNote - rootMidi;
+  const rate = Math.pow(2, semitone/12);
+  // create source
+  const src = audioCtx.createBufferSource();
+  src.buffer = channel.buffer;
+  src.playbackRate.value = rate;
+  const gain = audioCtx.createGain(); gain.gain.value = channel.gain;
+  src.connect(gain).connect(audioCtx.destination);
+  src.start();
+  activeSources.add(src);
+  src.onended = ()=>{ activeSources.delete(src); }
+}
+
+async function connectMIDI(){
+  if(!navigator.requestMIDIAccess) { alert('Web MIDI não suportado neste navegador. Use Chrome/Edge/Brave com suporte a WebMIDI.'); return; }
+  try{
+    midiAccess = await navigator.requestMIDIAccess();
+    for (let input of midiAccess.inputs.values()){
+      input.onmidimessage = onMIDIMessage;
+    }
+    midiAccess.onstatechange = (e)=>{
+      // rebind new inputs
+      for (let input of midiAccess.inputs.values()) input.onmidimessage = onMIDIMessage;
+    }
+    requestMidiBtn.textContent = 'MIDI conectado';
+  }catch(err){ console.error(err); alert('Falha no acesso ao MIDI: '+err); }
+}
+
+function onMIDIMessage(msg){
+  const [status, data1, data2] = msg.data;
+  const command = status & 0xf0;
+  const channelNum = status & 0x0f;
+  if(command === 0x90 && data2>0){ // note on
+    const midiNote = data1;
+    // trigger on all channels
+    channels.forEach(ch=>{ if(ch.enabled && ch.buffer) triggerNoteOn(ch, midiNote); });
+  }else if((command === 0x80) || (command===0x90 && data2===0)){
+    // note off - currently not stopping samples (simple sampler). Could implement ADSR or stop by stopping sources with matching pitch if desired.
+  }
+}
+
+addChannelBtn.addEventListener('click', ()=>createChannel());
+requestMidiBtn.addEventListener('click', connectMIDI);
+stopAllBtn.addEventListener('click', ()=>{ activeSources.forEach(s=>{ try{s.stop();}catch(e){} }); activeSources.clear(); });
+
+// create initial channels
+createChannel();
+createChannel();
+
+// unlock audio context on user gesture for mobile
+window.addEventListener('pointerdown', async ()=>{ if(audioCtx.state==='suspended') await audioCtx.resume(); }, {once:true});
+
+</script></body>
+</html>
